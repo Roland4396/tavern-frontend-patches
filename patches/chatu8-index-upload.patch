@@ -1,0 +1,70 @@
+--- a/index.js
++++ b/index.js
+@@ -6849,8 +6849,7 @@
+         if (currentData && Object.keys(currentData).length > 0) {
+           console.log("[Stego] \u68C0\u6D4B\u5230\u73B0\u6709\u6570\u636E\uFF0C\u5C1D\u8BD5\u91CD\u5EFA\u9690\u5199\u56FE\u7247...");
+           try {
+-            await deleteStegoImage();
+-            await createStegoImage();
++            await createStegoImage({ replaceExisting: true });
+             console.log("[Stego] \u9690\u5199\u56FE\u7247\u91CD\u5EFA\u6210\u529F");
+           } catch (rebuildError) {
+             console.error("[Stego] \u91CD\u5EFA\u9690\u5199\u56FE\u7247\u5931\u8D25:", rebuildError);
+@@ -6908,12 +6907,12 @@
+     return null;
+   }
+ }
+-async function createStegoImage() {
++async function createStegoImage(options) {
+   const stego = new ImageSteganography();
+   const currentData = extension_settings[extensionName].jiuguanStorage || {};
+   try {
+     const imageBase64 = await stego.encode(currentData);
+-    await uploadStegoImage(imageBase64);
++    await uploadStegoImage(imageBase64, options);
+     console.log("[Stego] \u65B0\u9690\u5199\u56FE\u7247\u521B\u5EFA\u5E76\u4E0A\u4F20\u6210\u529F");
+   } catch (error) {
+     console.error("[Stego] \u521B\u5EFA\u9690\u5199\u56FE\u7247\u5931\u8D25:", error);
+@@ -6926,17 +6925,16 @@
+     const currentData = extension_settings[extensionName].jiuguanStorage || {};
+     console.log("[Stego] \u51C6\u5907\u66F4\u65B0\u9690\u5199\u56FE\u7247\uFF0C\u6570\u636E\u6761\u76EE\u6570:", Object.keys(currentData).length);
+     const imageBase64 = await stego.encode(currentData);
+-    await deleteStegoImage();
+-    await uploadStegoImage(imageBase64);
++    await uploadStegoImage(imageBase64, { replaceExisting: true });
+     console.log("[Stego] \u9690\u5199\u56FE\u7247\u66F4\u65B0\u6210\u529F");
+   } catch (error) {
+     console.error("[Stego] \u66F4\u65B0\u9690\u5199\u56FE\u7247\u5931\u8D25:", error);
+     if (options?.throwOnError) throw error;
+   }
+ }
+-async function uploadStegoImage(imageBase64) {
++async function uploadStegoImage(imageBase64, { replaceExisting = false } = {}) {
+   const base64Data = imageBase64.split(",")[1] || imageBase64;
+-  const response = await fetch("/api/images/upload", {
++  const plain = {
+     method: "POST",
+     headers: getRequestHeaders(window.token),
+     body: JSON.stringify({
+@@ -6945,7 +6943,20 @@
+       ch_name: STEGO_FOLDER,
+       filename: STEGO_FILENAME
+     })
+-  });
++  };
++  // Only this fixed catalogue writer opts in. Share Tavern's configured worker,
++  // size limits and timeout. Older hosts may lack the optional transport module.
++  let request = plain;
++  try {
++    const { compressRequest } = await import("../../../request-compression.js");
++    request = await compressRequest(plain);
++  } catch {
++    // Preparation failed before dispatch: send the original bytes once.
++  }
++  // Preserve the existing replace sequence; never remove the previous snapshot
++  // while the new request is still being prepared, and never replay a failed POST.
++  if (replaceExisting) await deleteStegoImage();
++  const response = await fetch("/api/images/upload", request);
+   if (!response.ok) {
+     throw new Error(`\u4E0A\u4F20\u5931\u8D25: ${response.statusText}`);
+   }

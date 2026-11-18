@@ -1,0 +1,178 @@
+--- a/script.js
++++ b/script.js
+@@ -1,3 +1,5 @@
++import { deltaText as encodeSettingsDelta } from './scripts/settings-delta-v1.mjs';
++import { supportedCodec, unpack as unpackSettings } from './scripts/settings-read-v1.mjs';
+ import {
+     showdown,
+     moment,
+@@ -658,6 +660,8 @@
+ //settings
+ export let settings;
+ let lastSavedSettingsPayloadJson = null;
++let settingsDeltaEnabled = false;
++let legacySettingsBase = null;
+ export let amount_gen = 80; //default max length of AI generated responses
+ export let max_context = 2048;
+ 
+@@ -7980,7 +7984,7 @@
+ export async function getSettings(initLoaderHandle = null) {
+     const response = await fetch('/api/settings/get', {
+         method: 'POST',
+-        headers: getRequestHeaders(),
++        headers: {...getRequestHeaders(),'X-ST-Settings-Wire':'read-v1','X-ST-Settings-Codec':supportedCodec(),'X-ST-Settings-Revision':globalThis.crypto?.subtle?'no':'yes'},
+         body: JSON.stringify({}),
+         cache: 'no-cache',
+     });
+@@ -7991,7 +7995,19 @@
+         throw new Error('Error getting settings');
+     }
+ 
+-    const data = await response.json();
++    let data = await response.json();
++    const supportsDelta = data.wire === 1 || data.settings_delta_v1 === true;
++    if (data.wire === 1) {
++        try { data = await unpackSettings(data); }
++        catch {
++            // A cold cache, unrecognized codec or concurrent restart cannot produce a partial settings object.
++            const full = await fetch('/api/settings/get',{method:'POST',headers:getRequestHeaders(),body:'{}',cache:'no-store'});
++            if(!full.ok)throw new Error('Full settings recovery failed');
++            data=await full.json();
++        }
++    }
++    legacySettingsBase = data.settings_base || null;
++    settingsDeltaEnabled = supportsDelta && (!!globalThis.crypto?.subtle || !!legacySettingsBase);
+     if (data.result != 'file not find' && data.settings) {
+         settings = JSON.parse(data.settings);
+         lastSavedSettingsPayloadJson = JSON.stringify(settings);
+@@ -8169,18 +8185,28 @@
+                 settings = payload;
+             },
+             save: async ({ payload, payloadJson }) => {
++                const incremental = settingsDeltaEnabled && typeof lastSavedSettingsPayloadJson === 'string';
++                const encoded = incremental ? (legacySettingsBase ? JSON.stringify({base:legacySettingsBase,replace:JSON.parse(payloadJson)}) : await encodeSettingsDelta(lastSavedSettingsPayloadJson,payloadJson)) : payloadJson;
+                 const saveSettingsRequest = await compressRequest({
+-                    method: 'POST',
+-                    headers: getRequestHeaders(),
+-                    body: payloadJson,
++                    method: incremental ? 'PATCH' : 'POST',
++                    headers: incremental ? {...getRequestHeaders(),'X-ST-Settings-Wire':'delta-v1','X-ST-Settings-Revision':legacySettingsBase?'yes':'no'} : getRequestHeaders(),
++                    body: encoded,
+                     cache: 'no-cache',
+                 });
+                 const result = await fetch('/api/settings/save', saveSettingsRequest);
+ 
++                if (incremental && result.status === 409) {
++                    toastr.warning('另一个页面已经修改了同一项。未覆盖服务器设置，请保留当前改动，刷新后再合并。');
++                    throw new Error('Concurrent settings edit');
++                }
+                 if (!result.ok) {
+                     throw new Error(`Failed to save settings: ${result.statusText}`);
+                 }
+ 
++                if(incremental) {
++                    const ack=await result.json();if(ack.wire!==1)throw new Error('Invalid settings save acknowledgment');
++                    if(legacySettingsBase) legacySettingsBase=ack.revision;
++                }
+                 settings = payload;
+                 lastSavedSettingsPayloadJson = payloadJson;
+                 setLatestSaveBaseline('settings', payloadJson);
+--- a/settings.js
++++ b/settings.js
+@@ -1,3 +1,7 @@
++import {brotliDecompressSync as decompressSettingsPart} from 'node:zlib';
++import {createHash as settingsHash} from 'node:crypto';
++import { applyDelta } from './settings-delta.mjs';
++import { manifest, lookup } from './settings-read.mjs';
+ import fs from 'node:fs';
+ import path from 'node:path';
+ 
+@@ -202,6 +206,29 @@
+ }
+ 
+ export const router = express.Router();
++const versionedWriters = new Set();
++
++router.patch('/save', function (request, response) {
++    // Same origin/authentication, CSRF, body decompression, atomic writer, and backup owner as full saves.
++    // Synchronous read/check/write in the single Tavern writer: no races between comparison and commit.
++    if (request.get('X-ST-Settings-Wire') === 'delta-v1') {
++        try {
++            const file = path.join(request.user.directories.root, SETTINGS_FILE);
++            const state = applyDelta(JSON.parse(fs.readFileSync(file, 'utf8')), request.body);
++            if (state.changed) {
++                writeFileAtomicSync(file, JSON.stringify(state.data, null, 4), 'utf8');
++                versionedWriters.add(request.user.profile.handle);
++                triggerAutoSave(request.user.profile.handle);
++            }
++            return response.set('Cache-Control','no-store').send({ result:'ok', wire:1, ...(request.get('X-ST-Settings-Revision')==='yes'
++                    ? {revision:settingsHash('sha256').update(JSON.stringify(state.data)).digest('hex')} : {}) });
++        } catch (e) {
++            const status = [400,409].includes(e.status) ? e.status : 500;
++            return response.status(status).send({error:status===409?'settings_conflict':'settings_delta_failed'});
++        }
++    }
++    return response.sendStatus(400);
++});
+ 
+ router.post('/save', function (request, response) {
+     try {
+@@ -210,6 +237,7 @@
+         const currentContent = fs.existsSync(pathToSettings) ? fs.readFileSync(pathToSettings, 'utf8') : null;
+ 
+         if (currentContent !== settingsContent) {
++            if (versionedWriters.has(request.user.profile.handle)) return response.status(409).send({error:'refresh_old_settings_tab'});
+             writeFileAtomicSync(pathToSettings, settingsContent, 'utf8');
+             triggerAutoSave(request.user.profile.handle);
+         }
+@@ -221,8 +249,20 @@
+     }
+ });
+ 
++router.get('/wire-part/:id', (request,response) => {
++    const id=request.params.id;
++    if(!/^[a-f0-9]{64}$/.test(id))return response.sendStatus(404);
++    const part=lookup(request.user.profile.handle,id);
++    if(!part)return response.set('Cache-Control','no-store').sendStatus(410);
++    // The original document is NEVER stored in the HTTP cache; only the client
++    // can persist the sealed version. Let the browser's HTTP stack decode Brotli.
++    response.set('Cache-Control','private, no-store').set('X-ST-Settings-Part',id).vary('Accept-Encoding');
++    if(request.acceptsEncodings('br')==='br')return response.set('Content-Encoding','br').type('application/json').send(part);
++    return response.type('application/json').send(decompressSettingsPart(part));
++});
++
+ // Wintermute's code
+-router.post('/get', (request, response) => {
++router.post('/get', async (request, response) => {
+     let settings;
+     try {
+         const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
+@@ -271,7 +311,7 @@
+     const sysprompt = readAndParseFromDirectory(request.user.directories.sysprompt);
+     const reasoning = readAndParseFromDirectory(request.user.directories.reasoning);
+ 
+-    response.send({
++    const bootstrap = {
+         settings,
+         koboldai_settings,
+         koboldai_setting_names,
+@@ -298,7 +338,18 @@
+             maxPayloadSize: REQUEST_COMPRESSION_MAX || 0,
+             timeout: REQUEST_COMPRESSION_TIMEOUT || 0,
+         },
+-    });
++    };
++    if(request.get('X-ST-Settings-Wire') === 'read-v1'){
++        response.set('Cache-Control','private, no-store');
++        const codec=request.get('X-ST-Settings-Codec');
++        if(codec==='private-cache-v1'){
++            try {return response.json(await manifest(request.user.profile.handle,bootstrap,codec));}
++            catch { /* lossless legacy shape if the candidate snapshot exceeds cache capacity */ }
++        }
++        bootstrap.settings_delta_v1 = true;
++        if(request.get('X-ST-Settings-Revision')==='yes')bootstrap.settings_base=settingsHash('sha256').update(JSON.stringify(JSON.parse(settings))).digest('hex');
++    }
++    response.send(bootstrap);
+ });
+ 
+ router.post('/get-snapshots', async (request, response) => {
